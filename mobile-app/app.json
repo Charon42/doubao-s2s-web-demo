@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Doubao S2S Mobile",
+    "slug": "doubao-s2s-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "com.local.doubaos2smobile",
+      "usesCleartextTraffic": true,
+      "permissions": [
+        "RECORD_AUDIO"
+      ]
+    }
+  }
+}

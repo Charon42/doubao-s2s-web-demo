@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>豆包端到端实时语音 S2S Demo</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <h1>豆包实时语音 S2S Demo</h1>
+          <p id="statusText">未连接</p>
+        </div>
+        <div class="actions">
+          <button id="startBtn">开始通话</button>
+          <button id="stopBtn" disabled>停止</button>
+        </div>
+      </header>
+
+      <section class="chat-panel" aria-label="聊天记录">
+        <div id="chatMessages" class="chat-messages"></div>
+      </section>
+
+      <details class="logPanel" open>
+        <summary>事件日志</summary>
+        <div id="log" class="log"></div>
+      </details>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
