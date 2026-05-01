@@ -83,6 +83,13 @@ def _read_env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _read_env_bool(name: str, default: bool = False) -> bool:
+    value = _read_env(name)
+    if not value:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 DEBUG = _read_env("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
 
 
@@ -123,6 +130,9 @@ class DoubaoPacket:
     connect_id: str
     payload: bytes
     error_code: int | None = None
+    frame_len: int = 0
+    payload_offset: int = 0
+    payload_size: int = 0
 
 
 def encode_packet(
@@ -234,6 +244,9 @@ def decode_packet(data: bytes) -> DoubaoPacket:
         connect_id=connect_id,
         payload=payload,
         error_code=error_code,
+        frame_len=len(data),
+        payload_offset=offset,
+        payload_size=payload_size,
     )
 
 
@@ -263,6 +276,7 @@ class DoubaoRealtimeConfig:
     input_mod: str
     input_sample_rate: int
     output_sample_rate: int
+    enable_loudness_norm: bool
 
     @classmethod
     def from_env(cls) -> "DoubaoRealtimeConfig":
@@ -280,7 +294,8 @@ class DoubaoRealtimeConfig:
             greeting=_read_env("DOUBAO_GREETING"),
             input_mod=_read_env("DOUBAO_INPUT_MOD", "keep_alive"),
             input_sample_rate=int(_read_env("DOUBAO_INPUT_SAMPLE_RATE", "16000")),
-            output_sample_rate=24000,
+            output_sample_rate=int(_read_env("DOUBAO_OUTPUT_SAMPLE_RATE", "24000")),
+            enable_loudness_norm=_read_env_bool("DOUBAO_ENABLE_LOUDNESS_NORM", True),
         )
         config.validate()
         return config
@@ -303,6 +318,10 @@ class DoubaoRealtimeConfig:
                 + ", ".join(missing)
                 + f"; 当前工作目录={Path.cwd()}; .env路径={ENV_PATH}"
             )
+        if self.model_version == "1.2.1.1" and self.speaker.startswith(("saturn_", "S_")):
+            print("StartSession warning: O2.0 model=1.2.1.1 should not use SC saturn_/S_ speakers.")
+        if self.model_version == "2.2.0.0" and not self.speaker.startswith(("saturn_", "S_")):
+            print("StartSession warning: SC2.0 model=2.2.0.0 usually requires saturn_/S_ speaker or character_manifest.")
 
 
 def build_headers(config: DoubaoRealtimeConfig, connect_id: str) -> dict[str, str]:
@@ -351,6 +370,7 @@ class DoubaoRealtimeClient:
         self._log_persona_config()
         print(f"StartSession tts.audio_config: {start_session_payload['tts']['audio_config']}")
         print(f"StartSession dialog.extra: {start_session_payload['dialog']['extra']}")
+        print(f"StartSession full JSON: {json.dumps(start_session_payload, ensure_ascii=False, separators=(',', ':'))}")
         await self._send_event(EVENT_START_SESSION, start_session_payload)
         packet = await self._recv_packet()
         if packet.event != EVENT_SESSION_STARTED:
@@ -470,6 +490,20 @@ class DoubaoRealtimeClient:
         return decode_packet(message)
 
     def _start_session_payload(self) -> dict[str, Any]:
+        dialog: dict[str, Any] = {
+            "extra": {
+                "model": self.config.model_version,
+                "input_mod": self.config.input_mod,
+                "enable_conversation_truncate": True,
+            },
+        }
+        if self.config.bot_name:
+            dialog["bot_name"] = self.config.bot_name
+        if self.config.system_role:
+            dialog["system_role"] = self.config.system_role
+        if self.config.speaking_style:
+            dialog["speaking_style"] = self.config.speaking_style
+
         return {
             "asr": {
                 "language": "zh-CN",
@@ -478,26 +512,15 @@ class DoubaoRealtimeClient:
             },
             "tts": {
                 "speaker": self.config.speaker,
+                "enable_loudness_norm": self.config.enable_loudness_norm,
                 "audio_config": {
                     "channel": 1,
                     "format": "pcm_s16le",
-                    "sample_rate": 24000,
+                    "sample_rate": self.config.output_sample_rate,
                     "bits": 16,
                 },
             },
-            "dialog": {
-                "bot_name": self.config.bot_name,
-                "system_role": self.config.system_role,
-                "speaking_style": self.config.speaking_style,
-                # TODO: Confirm exact model version field path in the official
-                # realtime dialogue doc. Kept here because the doc exposes
-                # DOUBAO_MODEL_VERSION as a required runtime option.
-                "extra": {
-                    "model": self.config.model_version,
-                    "input_mod": self.config.input_mod,
-                    "enable_conversation_truncate": True,
-                },
-            },
+            "dialog": dialog,
         }
 
     def _log_persona_config(self) -> None:
@@ -524,16 +547,24 @@ class DoubaoRealtimeClient:
         }
 
     def _log_server_event(self, packet: DoubaoPacket, payload: dict[str, Any]) -> None:
-        if not DEBUG and packet.event in {EVENT_TTS_RESPONSE, EVENT_ASR_RESPONSE, EVENT_CHAT_RESPONSE}:
-            return
+        prefix = (
+            "doubao packet "
+            f"event_id={packet.event}, "
+            f"message_type={packet.message_type}, "
+            f"serialization={packet.serialization}, "
+            f"payload_len={len(packet.payload)}, "
+            f"payload_size={packet.payload_size}, "
+            f"payload_offset={packet.payload_offset}, "
+            f"frame_len={packet.frame_len}"
+        )
         if packet.event == EVENT_TTS_RESPONSE:
-            print(f"豆包事件 event_id={packet.event}, audio_bytes={len(packet.payload)}, payload_empty={not bool(packet.payload)}")
+            print(prefix)
             return
         if payload:
-            payload_text = json.dumps(payload, ensure_ascii=False)[:500]
+            payload_text = json.dumps(payload, ensure_ascii=False)[:200]
         else:
-            payload_text = _payload_text(packet)[:500]
-        print(f"豆包事件 event_id={packet.event}, payload_empty={not bool(packet.payload)}, payload_500={payload_text}")
+            payload_text = _payload_text(packet)[:200]
+        print(f"{prefix}, payload_200={payload_text}")
 
     def _packet_to_frontend_event(self, packet: DoubaoPacket, payload: dict[str, Any]) -> dict[str, Any] | None:
         ids = self._event_ids(payload)
@@ -567,6 +598,8 @@ class DoubaoRealtimeClient:
             audio = packet.payload
             if DEBUG:
                 print(f"?? TTSResponse ??????: {len(audio)}")
+            if not audio:
+                return None
             if audio.startswith(b"OggS"):
                 return {
                     "type": "error",
@@ -574,10 +607,19 @@ class DoubaoRealtimeClient:
                     "event": packet.event,
                     **ids,
                 }
+            if len(audio) % 2:
+                print(
+                    "odd pcm16 bytes "
+                    f"event_id={packet.event}, payload_len={len(audio)}, "
+                    f"payload_size={packet.payload_size}, payload_offset={packet.payload_offset}, frame_len={packet.frame_len}"
+                )
+                audio = audio[:-1]
+            if not audio:
+                return None
             return {
                 "type": "audio",
                 "audio": base64.b64encode(audio).decode("ascii"),
-                "sample_rate": 24000,
+                "sample_rate": self.config.output_sample_rate,
                 "event": packet.event,
                 **ids,
             }

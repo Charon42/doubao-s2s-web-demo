@@ -42,6 +42,7 @@ const SMALL_CHUNK_BYTES = 4096;
 const SMALL_CHUNK_FLUSH_BYTES = 8192;
 const TAIL_SMALL_FLUSH_DELAY_MS = 100;
 const TAIL_SILENCE_MS = 20;
+const TAIL_FADE_MS = 30;
 const MAX_TTS_QUEUE_CHUNKS = 200;
 const MAX_TTS_BUFFER_SEC = 15;
 let currentReplyId = null;
@@ -270,6 +271,12 @@ function base64ToArrayBuffer(base64) {
   return bytes.buffer;
 }
 
+function base64DecodedByteLength(base64) {
+  if (!base64) return 0;
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
+}
+
 function pcm16ToFloat32(arrayBuffer) {
   if (arrayBuffer.byteLength % 2 !== 0) {
     arrayBuffer = arrayBuffer.slice(0, arrayBuffer.byteLength - 1);
@@ -314,6 +321,7 @@ function createReplyPlayback(replyId) {
     underrunCount: 0,
     createdAt: performance.now(),
     smallFlushTimer: null,
+    delayedChunk: null,
     generation: audioPlaybackGeneration,
   };
 }
@@ -390,6 +398,22 @@ function makeSilenceChunk(durationMs = TAIL_SILENCE_MS) {
   return pcmArrayBufferToChunk(new ArrayBuffer(evenBytes), PLAYBACK_SAMPLE_RATE);
 }
 
+function fadeOutPcm16Bytes(bytes, validBytes, durationMs = TAIL_FADE_MS) {
+  const evenBytes = validBytes % 2 === 0 ? validBytes : validBytes - 1;
+  const sampleCount = Math.floor(evenBytes / 2);
+  const fadeSamples = Math.min(sampleCount, Math.floor((PLAYBACK_SAMPLE_RATE * durationMs) / 1000));
+  if (fadeSamples <= 0) return;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const firstFadeSample = sampleCount - fadeSamples;
+  for (let i = 0; i < fadeSamples; i += 1) {
+    const sampleIndex = firstFadeSample + i;
+    const offset = sampleIndex * 2;
+    const sample = view.getInt16(offset, true);
+    const scale = 1 - (i + 1) / fadeSamples;
+    view.setInt16(offset, Math.round(sample * scale), true);
+  }
+}
+
 function mergePcmChunks(chunks, appendSilence = false) {
   const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
   const silenceBytes = appendSilence ? makeSilenceChunk().bytes : 0;
@@ -399,11 +423,24 @@ function mergePcmChunks(chunks, appendSilence = false) {
     merged.set(new Uint8Array(chunk.arrayBuffer), offset);
     offset += chunk.bytes;
   }
+  if (appendSilence) {
+    fadeOutPcm16Bytes(merged, totalBytes);
+  }
   let buffer = merged.buffer;
   if (buffer.byteLength % 2 !== 0) {
     buffer = buffer.slice(0, buffer.byteLength - 1);
   }
   return pcmArrayBufferToChunk(buffer, PLAYBACK_SAMPLE_RATE);
+}
+
+function prepareTailChunk(chunk) {
+  if (!chunk) return null;
+  const minTailBytes = makeSilenceChunk(Math.max(TAIL_SILENCE_MS, TAIL_FADE_MS)).bytes;
+  const outputBytes = Math.max(chunk.bytes, minTailBytes);
+  const output = new Uint8Array(outputBytes);
+  output.set(new Uint8Array(chunk.arrayBuffer).slice(0, chunk.bytes), 0);
+  fadeOutPcm16Bytes(output, chunk.bytes);
+  return pcmArrayBufferToChunk(output.buffer, PLAYBACK_SAMPLE_RATE);
 }
 
 function clearSmallFlushTimer(playback) {
@@ -423,6 +460,32 @@ function flushPendingSmallChunks(playback, appendSilence = false) {
   playback.totalPendingDuration += merged.duration;
   playback.bufferedDuration += merged.duration;
   trimTtsQueue(playback);
+}
+
+function queueDecodedChunk(playback, chunk) {
+  if (!playback || !chunk) return;
+  playback.chunkCount += 1;
+  playback.bytes += chunk.bytes;
+  if (chunk.bytes < SMALL_CHUNK_BYTES && !playback.ttsDone) {
+    clearSmallFlushTimer(playback);
+    playback.pendingSmallChunks.push(chunk);
+    playback.pendingSmallBytes += chunk.bytes;
+    if (playback.pendingSmallBytes >= SMALL_CHUNK_FLUSH_BYTES) {
+      flushPendingSmallChunks(playback);
+    }
+  } else {
+    playback.pendingChunks.push(chunk);
+    playback.totalPendingDuration += chunk.duration;
+    playback.bufferedDuration += chunk.duration;
+  }
+  trimTtsQueue(playback);
+}
+
+function flushDelayedTtsChunk(playback, asTail = false) {
+  if (!playback || !playback.delayedChunk) return;
+  const chunk = asTail ? prepareTailChunk(playback.delayedChunk) : playback.delayedChunk;
+  playback.delayedChunk = null;
+  queueDecodedChunk(playback, chunk);
 }
 
 function trimTtsQueue(playback) {
@@ -605,7 +668,7 @@ function maybeCleanupReplyPlayback(playback) {
   }
 }
 
-function scheduleDecodedChunk(playback, chunk, ctx) {
+function scheduleDecodedChunk(playback, chunk, ctx, isTailChunk = false) {
   if (!playback || playback.generation !== audioPlaybackGeneration) return;
   if (!playback.contextPrimed || playback.nextPlayTime <= 0) {
     playback.nextPlayTime = ctx.currentTime + TAIL_LOW_BUFFER_AHEAD_SEC;
@@ -645,7 +708,8 @@ function scheduleDecodedChunk(playback, chunk, ctx) {
   const previousEndTime = playback.nextPlayTime;
   const startAt = Math.max(playback.nextPlayTime, now + MIN_BUFFER_DELAY_SEC);
   const endAt = startAt + audioBuffer.duration;
-  const fade = Math.min(0.005, audioBuffer.duration / 4);
+  const fadeIn = Math.min(0.005, audioBuffer.duration / 4);
+  const fadeOut = isTailChunk ? Math.min(TAIL_FADE_MS / 1000, audioBuffer.duration / 2) : Math.min(0.005, audioBuffer.duration / 4);
   const playbackGap = startAt - now;
   const scheduledGap = previousEndTime > 0 ? startAt - previousEndTime : 0;
 
@@ -653,8 +717,8 @@ function scheduleDecodedChunk(playback, chunk, ctx) {
   source.connect(gain);
   gain.connect(ctx.destination);
   gain.gain.setValueAtTime(0.0001, startAt);
-  gain.gain.linearRampToValueAtTime(1, startAt + fade);
-  gain.gain.setValueAtTime(1, Math.max(startAt + fade, endAt - fade));
+  gain.gain.linearRampToValueAtTime(1, startAt + fadeIn);
+  gain.gain.setValueAtTime(1, Math.max(startAt + fadeIn, endAt - fadeOut));
   gain.gain.linearRampToValueAtTime(0.0001, endAt);
   source.onended = () => {
     playback.activeSources.delete(source);
@@ -710,7 +774,12 @@ async function flushReplyPlayback(playback, force = false) {
   while (playback.pendingChunks.length) {
     const chunk = playback.pendingChunks.shift();
     playback.bufferedDuration = Math.max(0, playback.bufferedDuration - chunk.duration);
-    scheduleDecodedChunk(playback, chunk, ctx);
+    const isTailChunk =
+      playback.ttsDone &&
+      playback.pendingChunks.length === 0 &&
+      playback.pendingSmallChunks.length === 0 &&
+      playback.pendingSmallBytes === 0;
+    scheduleDecodedChunk(playback, chunk, ctx, isTailChunk);
   }
   logPlaybackSummary(playback, ctx);
   maybeCleanupReplyPlayback(playback);
@@ -722,21 +791,10 @@ async function schedulePcm16Chunk(base64Audio, sampleRate = 24000, replyId = nul
   if (!chunk) return null;
   const playback = getOrCreateReplyPlayback(replyId);
   if (playback.generation !== generation) return null;
-  playback.chunkCount += 1;
-  playback.bytes += chunk.bytes;
-  if (chunk.bytes < SMALL_CHUNK_BYTES && !playback.ttsDone) {
-    clearSmallFlushTimer(playback);
-    playback.pendingSmallChunks.push(chunk);
-    playback.pendingSmallBytes += chunk.bytes;
-    if (playback.pendingSmallBytes >= SMALL_CHUNK_FLUSH_BYTES) {
-      flushPendingSmallChunks(playback);
-    }
-  } else {
-    playback.pendingChunks.push(chunk);
-    playback.totalPendingDuration += chunk.duration;
-    playback.bufferedDuration += chunk.duration;
+  if (playback.delayedChunk) {
+    queueDecodedChunk(playback, playback.delayedChunk);
   }
-  trimTtsQueue(playback);
+  playback.delayedChunk = chunk;
   scheduleTailSmallFlush(playback);
   await flushReplyPlayback(playback);
   return null;
@@ -774,6 +832,7 @@ function stopPlayback(markInterrupted = true) {
     currentReplyPlayback.pendingSmallChunks = [];
     currentReplyPlayback.pendingSmallBytes = 0;
     currentReplyPlayback.bufferedDuration = 0;
+    currentReplyPlayback.delayedChunk = null;
     currentReplyPlayback.activeSources.clear();
   }
   currentReplyPlayback = null;
@@ -922,10 +981,15 @@ function switchToNewReply(replyId, reason) {
 
 function enqueueAudio(msg) {
   const replyId = msg.reply_id || null;
-  const bytes = msg.audio ? Math.floor((msg.audio.length * 3) / 4) : 0;
+  const bytes = base64DecodedByteLength(msg.audio);
   const playbackReplyId = currentReplyPlayback && currentReplyPlayback.replyId;
   browserAudioPacketsReceived += 1;
   browserAudioBytesReceived += bytes;
+
+  if (interrupted && waitingForNewReply && !replyId) {
+    console.warn("[playback] drop audio without reply_id while waiting for new reply");
+    return;
+  }
 
   if (interrupted && interruptedReplyId && replyId === interruptedReplyId) {
     console.warn("[playback] drop interrupted old reply audio", { replyId, interruptedReplyId });
@@ -1114,10 +1178,14 @@ function markReplyTtsDone(replyId, reason) {
     reason,
     pendingChunks: playback.pendingChunks.length,
     pendingSmallChunks: playback.pendingSmallChunks.length,
+    hasDelayedChunk: !!playback.delayedChunk,
     activeSources: playback.activeSources.size,
   });
   audioScheduleChain = audioScheduleChain
-    .then(() => flushReplyPlayback(playback, true))
+    .then(() => {
+      flushDelayedTtsChunk(playback, true);
+      return flushReplyPlayback(playback, true);
+    })
     .catch((err) => log("flush tts audio failed", { message: err.message, replyId: playback.replyId }));
 }
 
@@ -1178,17 +1246,24 @@ function handleServerMessage(event) {
     return;
   }
   if (msg.type === "audio") {
+    if (msg.event !== 352) {
+      log("drop non-352 audio message", { event: msg.event || null });
+      return;
+    }
+    log("audio event 352 received", {
+      replyId: msg.reply_id || null,
+      sampleRate: msg.sample_rate || null,
+      bytes: base64DecodedByteLength(msg.audio),
+    });
     setCallState(CallState.SPEAKING, "audio");
     enqueueAudio(msg);
     return;
   }
   if (msg.type === "user_speech_start") {
-    waitingForNewReply = true;
-    interrupted = true;
     setCallState(CallState.INTERRUPTED, "user_speech_start");
     log("waitingForNewReply true", { currentReplyId, speechReplyId: msg.reply_id || null });
-    log("interrupted true", { currentReplyId });
     stopAllAudio();
+    log("interrupted true", { interruptedReplyId, currentReplyId });
     setCallState(CallState.LISTENING, "interrupt handled");
     interimUserText = "";
     interimUserMessageEl = null;
