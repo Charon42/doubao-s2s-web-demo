@@ -7,7 +7,8 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
+import wave
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -77,6 +78,40 @@ PCM_16K_20MS_BYTES = 640
 DOUBAO_WS_MAX_QUEUE = 64
 DOUBAO_WS_WRITE_LIMIT = 256 * 1024
 INTERRUPT_DEDUPE_WINDOW_SEC = 0.8
+STREAM_LOG_INTERVAL_SEC = 1.0
+DEBUG_TTS_DIR = Path(__file__).resolve().parents[1] / "debug_tts"
+
+MODEL_O2 = "1.2.1.1"
+MODEL_SC2 = "2.2.0.0"
+VOICE_MODEL_TYPES = {"o2", "sc2"}
+VOICE_PROFILES = {"warm", "lively", "calm", "guide"}
+O2_PROFILE_DEFAULTS = {
+    "warm": {
+        "speaker": "zh_female_xiaohe_jupiter_bigtts",
+        "bot_name": "小蔚",
+        "system_role": "你是一个自然、亲切、有情绪变化的中文语音助手。你像朋友一样和用户聊天，不像客服，也不像播音员。",
+        "speaking_style": "说话要有真实聊天感，语气温暖、耐心、自然。句子要短，少用书面语。",
+    },
+    "lively": {
+        "speaker": "zh_female_vv_jupiter_bigtts",
+        "bot_name": "小蔚",
+        "system_role": "你是一个轻快、有活力的中文语音助手。你回答简洁自然，像朋友一样接话。",
+        "speaking_style": "语气轻快，有适度起伏。不要夸张表演，不要像念稿。",
+    },
+    "calm": {
+        "speaker": "zh_male_yunzhou_jupiter_bigtts",
+        "bot_name": "小蔚",
+        "system_role": "你是一个沉稳、清楚、有耐心的中文语音助手。你适合解释知识和梳理问题。",
+        "speaking_style": "语速适中，语气平稳清楚。遇到复杂问题要分句说明。",
+    },
+    "guide": {
+        "speaker": "zh_male_xiaotian_jupiter_bigtts",
+        "bot_name": "小蔚",
+        "system_role": "你是一个清晰、可靠的中文语音向导。你会主动帮助用户推进任务。",
+        "speaking_style": "像真人向导一样说话，清楚、简短、有条理。",
+    },
+}
+O2_SPEAKERS = {profile["speaker"] for profile in O2_PROFILE_DEFAULTS.values()}
 
 
 def _read_env(name: str, default: str = "") -> str:
@@ -267,8 +302,11 @@ class DoubaoRealtimeConfig:
     access_key: str
     resource_id: str
     app_key: str
+    voice_model_type: str
+    voice_profile: str
     model_version: str
     speaker: str
+    character_manifest: str
     bot_name: str
     system_role: str
     speaking_style: str
@@ -277,25 +315,48 @@ class DoubaoRealtimeConfig:
     input_sample_rate: int
     output_sample_rate: int
     enable_loudness_norm: bool
+    enable_custom_vad: bool
+    end_smooth_window_ms: int
+    enable_asr_twopass: bool
+    debug_save_tts_wav: bool
+    debug_tts_tail_fade_ms: int
+
 
     @classmethod
     def from_env(cls) -> "DoubaoRealtimeConfig":
+        voice_model_type = _read_env("VOICE_MODEL_TYPE", "o2").lower()
+        voice_profile = _read_env("VOICE_PROFILE", "warm").lower()
+        if voice_model_type not in VOICE_MODEL_TYPES:
+            voice_model_type = "o2"
+        if voice_profile not in VOICE_PROFILES:
+            voice_profile = "warm"
+        o2_defaults = O2_PROFILE_DEFAULTS[voice_profile]
+        model_default = MODEL_SC2 if voice_model_type == "sc2" else MODEL_O2
+        speaker_default = _voice_speaker_default(voice_model_type, voice_profile)
         config = cls(
             ws_url=_read_env("DOUBAO_WS_URL", "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"),
             app_id=_read_env("DOUBAO_APP_ID"),
             access_key=_read_env("DOUBAO_ACCESS_KEY"),
             resource_id=_read_env("DOUBAO_RESOURCE_ID", "volc.speech.dialog"),
             app_key=_read_env("DOUBAO_APP_KEY"),
-            model_version=_read_env("DOUBAO_MODEL_VERSION", "1.2.1.1"),
-            speaker=_read_env("DOUBAO_SPEAKER", "zh_female_vv_jupiter_bigtts"),
-            bot_name=_read_env("DOUBAO_BOT_NAME"),
-            system_role=_read_env("DOUBAO_SYSTEM_ROLE"),
-            speaking_style=_read_env("DOUBAO_SPEAKING_STYLE"),
+            voice_model_type=voice_model_type,
+            voice_profile=voice_profile,
+            model_version=model_default,
+            speaker=_read_env("VOICE_SPEAKER") or (_read_env("DOUBAO_SPEAKER") if voice_model_type == "o2" else "") or speaker_default,
+            character_manifest=_read_env("VOICE_CHARACTER_MANIFEST") or _read_env("DOUBAO_CHARACTER_MANIFEST"),
+            bot_name=_read_env("DOUBAO_BOT_NAME", o2_defaults["bot_name"]),
+            system_role=_read_env("DOUBAO_SYSTEM_ROLE", o2_defaults["system_role"]),
+            speaking_style=_read_env("DOUBAO_SPEAKING_STYLE", o2_defaults["speaking_style"]),
             greeting=_read_env("DOUBAO_GREETING"),
             input_mod=_read_env("DOUBAO_INPUT_MOD", "keep_alive"),
             input_sample_rate=int(_read_env("DOUBAO_INPUT_SAMPLE_RATE", "16000")),
             output_sample_rate=int(_read_env("DOUBAO_OUTPUT_SAMPLE_RATE", "24000")),
             enable_loudness_norm=_read_env_bool("DOUBAO_ENABLE_LOUDNESS_NORM", True),
+            enable_custom_vad=_read_env_bool("DOUBAO_ENABLE_CUSTOM_VAD", True),
+            end_smooth_window_ms=int(_read_env("DOUBAO_END_SMOOTH_WINDOW_MS", "2500")),
+            enable_asr_twopass=_read_env_bool("DOUBAO_ENABLE_ASR_TWOPASS", True),
+            debug_save_tts_wav=_read_env_bool("DEBUG_SAVE_TTS_WAV", False),
+            debug_tts_tail_fade_ms=int(_read_env("DEBUG_TTS_TAIL_FADE_MS", "80")),
         )
         config.validate()
         return config
@@ -318,10 +379,102 @@ class DoubaoRealtimeConfig:
                 + ", ".join(missing)
                 + f"; 当前工作目录={Path.cwd()}; .env路径={ENV_PATH}"
             )
-        if self.model_version == "1.2.1.1" and self.speaker.startswith(("saturn_", "S_")):
-            print("StartSession warning: O2.0 model=1.2.1.1 should not use SC saturn_/S_ speakers.")
-        if self.model_version == "2.2.0.0" and not self.speaker.startswith(("saturn_", "S_")):
-            print("StartSession warning: SC2.0 model=2.2.0.0 usually requires saturn_/S_ speaker or character_manifest.")
+        validateVoiceConfig(self)
+
+
+@dataclass
+class StreamEventLogStats:
+    count: int = 0
+    bytes: int = 0
+    last_payload: str = ""
+    started_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class TtsPcmDebugState:
+    reply_id: str
+    chunks: list[bytes] = field(default_factory=list)
+    odd_chunk_count: int = 0
+    short_last_chunk_bytes: int = 0
+
+
+def _voice_speaker_default(voice_model_type: str, voice_profile: str) -> str:
+    if voice_model_type == "o2":
+        return O2_PROFILE_DEFAULTS[voice_profile]["speaker"]
+    return _read_env(f"VOICE_SC2_SPEAKER_{voice_profile.upper()}", _read_env("VOICE_SC2_SPEAKER"))
+
+
+def _is_sc_speaker(speaker: str) -> bool:
+    return speaker.startswith(("saturn_", "S_"))
+
+
+def _safe_filename_part(value: str, fallback: str = "unknown") -> str:
+    clean = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value.strip())
+    return clean[:80] or fallback
+
+
+def validateVoiceConfig(config: DoubaoRealtimeConfig) -> None:
+    if config.voice_model_type not in VOICE_MODEL_TYPES:
+        raise DoubaoConfigError(f"VOICE_MODEL_TYPE must be one of {sorted(VOICE_MODEL_TYPES)}")
+    if config.voice_profile not in VOICE_PROFILES:
+        raise DoubaoConfigError(f"VOICE_PROFILE must be one of {sorted(VOICE_PROFILES)}")
+    if config.voice_model_type == "o2":
+        if config.model_version != MODEL_O2:
+            raise DoubaoConfigError(f"O2.0 requires model={MODEL_O2}, got {config.model_version}")
+        if config.speaker not in O2_SPEAKERS:
+            raise DoubaoConfigError(f"O2.0 speaker must be one of {sorted(O2_SPEAKERS)}, got {config.speaker}")
+        if config.character_manifest:
+            raise DoubaoConfigError("O2.0 must not use character_manifest")
+        return
+    if config.model_version != MODEL_SC2:
+        raise DoubaoConfigError(f"SC2.0 requires model={MODEL_SC2}, got {config.model_version}")
+    if not _is_sc_speaker(config.speaker):
+        raise DoubaoConfigError("SC2.0 requires a valid saturn_/S_ speaker")
+    if not config.character_manifest:
+        raise DoubaoConfigError("SC2.0 requires VOICE_CHARACTER_MANIFEST")
+
+
+def buildDoubaoStartSessionConfig(config: DoubaoRealtimeConfig) -> dict[str, Any]:
+    validateVoiceConfig(config)
+    dialog: dict[str, Any] = {
+        "extra": {
+            "model": config.model_version,
+            "input_mod": config.input_mod,
+            "enable_conversation_truncate": True,
+        },
+    }
+    if config.voice_model_type == "o2":
+        if config.bot_name:
+            dialog["bot_name"] = config.bot_name
+        if config.system_role:
+            dialog["system_role"] = config.system_role
+        if config.speaking_style:
+            dialog["speaking_style"] = config.speaking_style
+    else:
+        if config.character_manifest:
+            dialog["character_manifest"] = config.character_manifest
+
+    return {
+        "asr": {
+            "language": "zh-CN",
+            "extra": {
+                "enable_custom_vad": config.enable_custom_vad,
+                "end_smooth_window_ms": config.end_smooth_window_ms,
+                "enable_asr_twopass": config.enable_asr_twopass,
+            },
+        },
+        "tts": {
+            "speaker": config.speaker,
+            "enable_loudness_norm": config.enable_loudness_norm,
+            "audio_config": {
+                "channel": 1,
+                "format": "pcm_s16le",
+                "sample_rate": config.output_sample_rate,
+                "bits": 16,
+            },
+        },
+        "dialog": dialog,
+    }
 
 
 def build_headers(config: DoubaoRealtimeConfig, connect_id: str) -> dict[str, str]:
@@ -348,6 +501,8 @@ class DoubaoRealtimeClient:
         self.last_audio_send_ts = 0.0
         self.last_interrupt_key: str | None = None
         self.last_interrupt_ts = 0.0
+        self.stream_log_stats: dict[int, StreamEventLogStats] = {}
+        self.tts_pcm_debug: TtsPcmDebugState | None = None
 
     async def connect(self) -> None:
         print(f"DOUBAO_S2S_WS_URL 是否为空: {not bool(self.config.ws_url)}")
@@ -390,6 +545,35 @@ class DoubaoRealtimeClient:
             pass
         await self.ws.close()
         self.ws = None
+
+    async def restart_session(self, config: DoubaoRealtimeConfig | None = None) -> None:
+        if not self.ws:
+            if config:
+                self.config = config
+            await self.connect()
+            return
+        if config:
+            config.validate()
+            self.config = config
+        try:
+            await self._send_event(EVENT_FINISH_SESSION, {"session_id": self.session_id})
+        except Exception as exc:
+            print(f"FinishSession before restart failed: {type(exc).__name__}: {exc}")
+        self.session_id = uuid.uuid4().hex
+        self._audio_buffer.clear()
+        self.current_question_id = None
+        self.current_reply_id = None
+        self.last_interrupt_key = None
+        self.last_interrupt_ts = 0.0
+        start_session_payload = self._start_session_payload()
+        self._log_persona_config()
+        print(f"StartSession full JSON: {json.dumps(start_session_payload, ensure_ascii=False, separators=(',', ':'))}")
+        await self._send_event(EVENT_START_SESSION, start_session_payload)
+        packet = await self._recv_packet()
+        if packet.event != EVENT_SESSION_STARTED:
+            raise RuntimeError(f"unexpected StartSession response event={packet.event}, payload={_payload_text(packet)}")
+        if packet.session_id:
+            self.session_id = packet.session_id
 
     async def send_audio(self, pcm16: bytes) -> None:
         if not self.ws:
@@ -490,38 +674,7 @@ class DoubaoRealtimeClient:
         return decode_packet(message)
 
     def _start_session_payload(self) -> dict[str, Any]:
-        dialog: dict[str, Any] = {
-            "extra": {
-                "model": self.config.model_version,
-                "input_mod": self.config.input_mod,
-                "enable_conversation_truncate": True,
-            },
-        }
-        if self.config.bot_name:
-            dialog["bot_name"] = self.config.bot_name
-        if self.config.system_role:
-            dialog["system_role"] = self.config.system_role
-        if self.config.speaking_style:
-            dialog["speaking_style"] = self.config.speaking_style
-
-        return {
-            "asr": {
-                "language": "zh-CN",
-                # TODO: If the official doc requires explicit input audio config,
-                # add it here using the documented field name.
-            },
-            "tts": {
-                "speaker": self.config.speaker,
-                "enable_loudness_norm": self.config.enable_loudness_norm,
-                "audio_config": {
-                    "channel": 1,
-                    "format": "pcm_s16le",
-                    "sample_rate": self.config.output_sample_rate,
-                    "bits": 16,
-                },
-            },
-            "dialog": dialog,
-        }
+        return buildDoubaoStartSessionConfig(self.config)
 
     def _log_persona_config(self) -> None:
         print("已加载人设配置")
@@ -529,6 +682,10 @@ class DoubaoRealtimeClient:
         print(f"system_role: {self.config.system_role[:30]}")
         print(f"speaking_style: {self.config.speaking_style[:30]}")
         print(f"greeting: {self.config.greeting[:30]}")
+        print(f"voice_model_type: {self.config.voice_model_type}")
+        print(f"voice_profile: {self.config.voice_profile}")
+        print(f"model: {self.config.model_version}")
+        print(f"speaker: {self.config.speaker}")
 
     def _update_current_ids(self, payload: dict[str, Any]) -> None:
         question_id = payload.get("question_id")
@@ -557,14 +714,41 @@ class DoubaoRealtimeClient:
             f"payload_offset={packet.payload_offset}, "
             f"frame_len={packet.frame_len}"
         )
-        if packet.event == EVENT_TTS_RESPONSE:
-            print(prefix)
+        if packet.event in {EVENT_TTS_RESPONSE, EVENT_ASR_RESPONSE, EVENT_CHAT_RESPONSE}:
+            if payload:
+                payload_text = json.dumps(payload, ensure_ascii=False)[:120]
+            else:
+                payload_text = ""
+            self._log_stream_event_summary(packet, payload_text)
             return
         if payload:
             payload_text = json.dumps(payload, ensure_ascii=False)[:200]
         else:
             payload_text = _payload_text(packet)[:200]
         print(f"{prefix}, payload_200={payload_text}")
+
+    def _log_stream_event_summary(self, packet: DoubaoPacket, payload_text: str) -> None:
+        event_id = packet.event
+        if event_id is None:
+            return
+        now = time.monotonic()
+        stats = self.stream_log_stats.get(event_id)
+        if not stats:
+            stats = StreamEventLogStats(started_at=now)
+            self.stream_log_stats[event_id] = stats
+        stats.count += 1
+        stats.bytes += len(packet.payload)
+        if payload_text:
+            stats.last_payload = payload_text
+        if now - stats.started_at < STREAM_LOG_INTERVAL_SEC:
+            return
+        elapsed = max(now - stats.started_at, 0.001)
+        print(
+            "doubao stream stats "
+            f"event_id={event_id}, count={stats.count}, bytes={stats.bytes}, "
+            f"rate={stats.count / elapsed:.1f}/s, last_payload_120={stats.last_payload}"
+        )
+        self.stream_log_stats[event_id] = StreamEventLogStats(started_at=now)
 
     def _packet_to_frontend_event(self, packet: DoubaoPacket, payload: dict[str, Any]) -> dict[str, Any] | None:
         ids = self._event_ids(payload)
@@ -616,6 +800,7 @@ class DoubaoRealtimeClient:
                 audio = audio[:-1]
             if not audio:
                 return None
+            self._record_tts_pcm_debug(ids.get("reply_id"), audio, len(packet.payload) % 2 != 0)
             return {
                 "type": "audio",
                 "audio": base64.b64encode(audio).decode("ascii"),
@@ -628,10 +813,101 @@ class DoubaoRealtimeClient:
         if packet.event == EVENT_CHAT_ENDED:
             return {"type": "assistant_text_done", "event": packet.event, "raw": payload, **ids}
         if packet.event == EVENT_TTS_ENDED:
+            self._finalize_tts_pcm_debug(ids.get("reply_id"))
             return {"type": "tts_done", "event": packet.event, "raw": payload, **ids}
         if packet.event in {EVENT_CONNECTION_STARTED, EVENT_SESSION_STARTED}:
             return {"type": "event", "event": packet.event, "payload": payload or _payload_text(packet)}
         return {"type": "event", "event": packet.event, "payload": payload or _payload_text(packet), **ids}
+
+    def _record_tts_pcm_debug(self, reply_id: str | None, audio: bytes, was_odd_chunk: bool) -> None:
+        effective_reply_id = reply_id or self.current_reply_id or "unknown"
+        if self.tts_pcm_debug and self.tts_pcm_debug.reply_id != effective_reply_id:
+            self._finalize_tts_pcm_debug(self.tts_pcm_debug.reply_id)
+        if not self.tts_pcm_debug:
+            self.tts_pcm_debug = TtsPcmDebugState(reply_id=effective_reply_id)
+        self.tts_pcm_debug.chunks.append(audio)
+        if was_odd_chunk:
+            self.tts_pcm_debug.odd_chunk_count += 1
+        self.tts_pcm_debug.short_last_chunk_bytes = len(audio)
+
+    def _finalize_tts_pcm_debug(self, reply_id: str | None) -> None:
+        state = self.tts_pcm_debug
+        if not state or not state.chunks:
+            return
+        if reply_id and state.reply_id != reply_id:
+            return
+        pcm = b"".join(state.chunks)
+        stats = self._pcm16_stats(pcm)
+        last_two_bytes = sum(len(chunk) for chunk in state.chunks[-2:])
+        min_tail_bytes = int(self.config.output_sample_rate * self.config.debug_tts_tail_fade_ms / 1000) * 2
+        tail_buffer_bytes = max(last_two_bytes, min_tail_bytes)
+        duration_ms = stats["sample_count"] / self.config.output_sample_rate * 1000 if self.config.output_sample_rate else 0
+        summary = {
+            "reply_id": state.reply_id,
+            "model": self.config.model_version,
+            "voice_model_type": self.config.voice_model_type,
+            "speaker": self.config.speaker,
+            "totalBytes": len(pcm),
+            "durationMs": round(duration_ms, 1),
+            "peakMax": stats["peak_max"],
+            "peakMin": stats["peak_min"],
+            "rms": round(stats["rms"], 2),
+            "dcOffset": round(stats["dc_offset"], 2),
+            "clippingSamples": stats["clipping_samples"],
+            "oddChunkCount": state.odd_chunk_count,
+            "shortLastChunkBytes": state.short_last_chunk_bytes if state.short_last_chunk_bytes < 960 else 0,
+            "tailBufferBytes": tail_buffer_bytes,
+        }
+        if self.config.debug_save_tts_wav:
+            summary["wavPath"] = str(self._save_tts_debug_wav(state.reply_id, pcm))
+        print(f"tts pcm stats {json.dumps(summary, ensure_ascii=False)}")
+        self.tts_pcm_debug = None
+
+    def _pcm16_stats(self, pcm: bytes) -> dict[str, float | int]:
+        sample_count = len(pcm) // 2
+        if sample_count <= 0:
+            return {
+                "sample_count": 0,
+                "peak_max": 0,
+                "peak_min": 0,
+                "rms": 0.0,
+                "dc_offset": 0.0,
+                "clipping_samples": 0,
+            }
+        peak_max = -32768
+        peak_min = 32767
+        total = 0
+        total_squares = 0
+        clipping_samples = 0
+        for offset in range(0, sample_count * 2, 2):
+            sample = int.from_bytes(pcm[offset : offset + 2], "little", signed=True)
+            peak_max = max(peak_max, sample)
+            peak_min = min(peak_min, sample)
+            total += sample
+            total_squares += sample * sample
+            if sample > 32000 or sample < -32000:
+                clipping_samples += 1
+        return {
+            "sample_count": sample_count,
+            "peak_max": peak_max,
+            "peak_min": peak_min,
+            "rms": (total_squares / sample_count) ** 0.5,
+            "dc_offset": total / sample_count,
+            "clipping_samples": clipping_samples,
+        }
+
+    def _save_tts_debug_wav(self, reply_id: str, pcm: bytes) -> Path:
+        DEBUG_TTS_DIR.mkdir(parents=True, exist_ok=True)
+        reply_part = _safe_filename_part(reply_id)
+        model_part = _safe_filename_part(self.config.voice_model_type)
+        speaker_part = _safe_filename_part(self.config.speaker)
+        wav_path = DEBUG_TTS_DIR / f"debug_tts_{reply_part}_{model_part}_{speaker_part}.wav"
+        with wave.open(str(wav_path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(self.config.output_sample_rate)
+            wav.writeframes(pcm)
+        return wav_path
 
 def _decode_payload_json(payload: bytes) -> dict[str, Any]:
     if not payload:

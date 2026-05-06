@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import math
+import secrets
 import traceback
 from pathlib import Path
 
@@ -24,13 +26,42 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIR = ROOT / "frontend"
 
+
+def _csv_env(name: str, default: str = "") -> list[str]:
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _default_allowed_origins() -> str:
+    port = os.getenv("PORT", "8000")
+    return f"http://127.0.0.1:{port},http://localhost:{port}"
+
+
+ALLOWED_ORIGINS = _csv_env("ALLOWED_ORIGINS", _default_allowed_origins())
+WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN", "").strip()
+
+
+def _is_allowed_origin(origin: str | None) -> bool:
+    if not origin:
+        return True
+    return "*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS
+
+
+def _is_ws_authorized(websocket: WebSocket) -> bool:
+    if not _is_allowed_origin(websocket.headers.get("origin")):
+        return False
+    if not WS_AUTH_TOKEN:
+        return True
+    token = websocket.query_params.get("token") or websocket.headers.get("sec-websocket-protocol") or ""
+    return secrets.compare_digest(token, WS_AUTH_TOKEN)
+
 app = FastAPI(title="Doubao Realtime S2S Web Demo")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
@@ -50,6 +81,9 @@ async def safe_send_json(websocket: WebSocket, data: dict) -> bool:
 
 @app.websocket("/ws/call")
 async def call_ws(websocket: WebSocket) -> None:
+    if not _is_ws_authorized(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     print("浏览器 WebSocket 已连接")
     browser_closed = False
@@ -174,7 +208,7 @@ async def call_ws(websocket: WebSocket) -> None:
         last_browser_audio_packets = 0
         last_browser_audio_bytes = 0
         while not browser_closed:
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             audio_packets_per_sec = browser_audio_packets_received - last_browser_audio_packets
             audio_bytes_per_sec = browser_audio_bytes_received - last_browser_audio_bytes
             task_requests_per_sec = doubao.task_requests_sent_last_second if doubao else 0
@@ -184,6 +218,7 @@ async def call_ws(websocket: WebSocket) -> None:
             last_browser_audio_bytes = browser_audio_bytes_received
             print(
                 "audio stats "
+                f"windowSec=2, "
                 f"browserAudioPacketsPerSec={audio_packets_per_sec}, "
                 f"browserAudioBytesPerSec={audio_bytes_per_sec}, "
                 f"doubaoTaskRequestsPerSec={task_requests_per_sec}, "

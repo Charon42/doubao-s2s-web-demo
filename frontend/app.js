@@ -23,6 +23,13 @@ const AUDIO_PACKET_BYTES = 640;
 const AUDIO_PACKET_INTERVAL_MS = 20;
 const MAX_AUDIO_QUEUE_PACKETS = 20;
 const DEBUG = new URLSearchParams(location.search).get("debug") === "1" || localStorage.getItem("DEBUG") === "true";
+const PLAYBACK_GAIN = Number(new URLSearchParams(location.search).get("playbackGain") || localStorage.getItem("PLAYBACK_GAIN") || "0.85");
+const DEBUG_PLAY_FULL_TTS_BUFFER =
+  new URLSearchParams(location.search).get("fullTtsBuffer") === "1" ||
+  localStorage.getItem("DEBUG_PLAY_FULL_TTS_BUFFER") === "true";
+const PAUSE_MIC_WHILE_ASSISTANT_SPEAKING =
+  new URLSearchParams(location.search).get("pauseMicDuringTts") === "1" ||
+  localStorage.getItem("PAUSE_MIC_WHILE_ASSISTANT_SPEAKING") === "true";
 const CallState = Object.freeze({
   IDLE: "IDLE",
   LISTENING: "LISTENING",
@@ -32,19 +39,30 @@ const CallState = Object.freeze({
   CLOSED: "CLOSED",
 });
 const MIN_START_BUFFER_SEC = 0.25;
-const LONG_REPLY_START_BUFFER_SEC = 0.45;
-const MIN_BUFFER_DELAY_SEC = 0.03;
-const LOW_BUFFER_AHEAD_SEC = 0.05;
-const RECONNECT_DELAY_SEC = 0.06;
-const TAIL_LOW_BUFFER_AHEAD_SEC = 0.12;
-const TAIL_RECONNECT_DELAY_SEC = 0.08;
+const LONG_REPLY_START_BUFFER_SEC = 0.55;
+const MIN_BUFFER_DELAY_SEC = 0.08;
+const LOW_BUFFER_AHEAD_SEC = 0.12;
+const RECONNECT_DELAY_SEC = 0.16;
+const TAIL_LOW_BUFFER_AHEAD_SEC = 0.18;
+const TAIL_RECONNECT_DELAY_SEC = 0.2;
 const SMALL_CHUNK_BYTES = 4096;
-const SMALL_CHUNK_FLUSH_BYTES = 8192;
+const SMALL_CHUNK_FLUSH_BYTES = 6720;
+const MIN_PLAYBACK_BLOCK_BYTES = 6720;
 const TAIL_SMALL_FLUSH_DELAY_MS = 100;
 const TAIL_SILENCE_MS = 20;
-const TAIL_FADE_MS = 30;
+const TAIL_FADE_MS = Number(new URLSearchParams(location.search).get("tailFadeMs") || localStorage.getItem("TAIL_FADE_MS") || "80");
+const INTERRUPT_FADE_MS = 35;
+const TAIL_HOLD_CHUNKS = 2;
+const SHORT_TAIL_CHUNK_BYTES = 960;
 const MAX_TTS_QUEUE_CHUNKS = 200;
-const MAX_TTS_BUFFER_SEC = 15;
+const MAX_TTS_BUFFER_SEC = 60;
+const ASR_END_DEBOUNCE_MS = 400;
+const USER_TEXT_FLUSH_MS = 150;
+const ASSISTANT_TEXT_FLUSH_MS = 150;
+const WS_AUTH_TOKEN = new URLSearchParams(location.search).get("wsToken") || localStorage.getItem("WS_AUTH_TOKEN") || "";
+const MAX_WS_RECONNECT_ATTEMPTS = 5;
+const WS_RECONNECT_BASE_DELAY_MS = 800;
+const WS_RECONNECT_MAX_DELAY_MS = 5000;
 let currentReplyId = null;
 let waitingForNewReply = false;
 let interrupted = false;
@@ -69,6 +87,7 @@ let interimUserMessageEl = null;
 let activeAssistantMessageEl = null;
 let activeAssistantReplyId = null;
 let assistantTextByReplyId = new Map();
+let assistantTextDoneReplyIds = new Set();
 let latestUserInterimText = "";
 let userInterimFlushTimer = null;
 let pendingAssistantTextByReplyId = new Map();
@@ -83,6 +102,19 @@ let wsListenersAttached = false;
 let wsSendCount = 0;
 let wsSendCountLastSecond = 0;
 let audioPacketsSentLastSecond = 0;
+let userSpeechEndTimer = null;
+let userSpeechEndDeadline = 0;
+let lastAsrActivityAt = 0;
+let audioEventStats = null;
+let audioEventStatsTimer = null;
+let perfExpectedNextAt = 0;
+let lastUserTextByReplyId = new Map();
+let userTextStats = null;
+let userTextStatsTimer = null;
+let fullTtsBuffersByReplyId = new Map();
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let manualStopRequested = false;
 
 class AudioSender {
   constructor(getSocket) {
@@ -159,6 +191,14 @@ class AudioSender {
     if (!recordingStarted || this.queue.length === 0) return;
     const socket = this.getSocket();
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (PAUSE_MIC_WHILE_ASSISTANT_SPEAKING && isAssistantSpeakingForMic()) {
+      const dropCount = this.queue.length;
+      this.queue = [];
+      this.remainder = new Uint8Array(0);
+      this.droppedPackets += dropCount;
+      audioPacketsDroppedByBackpressure += dropCount;
+      return;
+    }
     const bufferedAmount = socket.bufferedAmount || 0;
     if (bufferedAmount > maxWsBufferedAmount) maxWsBufferedAmount = bufferedAmount;
     if (bufferedAmount > 2 * 1024 * 1024) {
@@ -210,6 +250,65 @@ function setCallState(nextState, reason = "") {
   debugLog("state changed", { state: callState, reason });
 }
 
+function isAssistantSpeakingForMic() {
+  return callState === CallState.SPEAKING || getTtsQueueSize() > 0;
+}
+
+function flushAudioEventStats() {
+  audioEventStatsTimer = null;
+  if (!audioEventStats || audioEventStats.count === 0) return;
+  log("audio event 352 stats", audioEventStats);
+  audioEventStats = null;
+}
+
+function recordAudioEvent352(msg) {
+  const bytes = base64DecodedByteLength(msg.audio);
+  if (!audioEventStats) {
+    audioEventStats = {
+      count: 0,
+      bytes: 0,
+      replyId: msg.reply_id || null,
+      sampleRate: msg.sample_rate || null,
+    };
+  }
+  audioEventStats.count += 1;
+  audioEventStats.bytes += bytes;
+  audioEventStats.replyId = msg.reply_id || audioEventStats.replyId;
+  audioEventStats.sampleRate = msg.sample_rate || audioEventStats.sampleRate;
+  if (!audioEventStatsTimer) {
+    audioEventStatsTimer = setTimeout(flushAudioEventStats, 1000);
+  }
+}
+
+function flushUserTextStats() {
+  userTextStatsTimer = null;
+  if (!userTextStats || userTextStats.count === 0) return;
+  log("user_text stats", userTextStats);
+  userTextStats = null;
+}
+
+function recordUserTextStats(kind, replyId, text) {
+  if (!userTextStats) {
+    userTextStats = {
+      count: 0,
+      duplicates: 0,
+      changes: 0,
+      lastKind: kind,
+      replyId: replyId || null,
+      lastText: "",
+    };
+  }
+  userTextStats.count += 1;
+  userTextStats.lastKind = kind;
+  userTextStats.replyId = replyId || userTextStats.replyId;
+  userTextStats.lastText = text;
+  if (kind === "duplicate") userTextStats.duplicates += 1;
+  if (kind === "change") userTextStats.changes += 1;
+  if (!userTextStatsTimer) {
+    userTextStatsTimer = setTimeout(flushUserTextStats, 1000);
+  }
+}
+
 function safeWsSend(data, kind = "control") {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   ws.send(data);
@@ -237,7 +336,9 @@ function setStatus(text) {
 
 function websocketUrl() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  return `${protocol}://${location.host}/ws/call`;
+  const url = new URL(`${protocol}://${location.host}/ws/call`);
+  if (WS_AUTH_TOKEN) url.searchParams.set("token", WS_AUTH_TOKEN);
+  return url.toString();
 }
 
 function floatToPcm16(float32) {
@@ -321,7 +422,7 @@ function createReplyPlayback(replyId) {
     underrunCount: 0,
     createdAt: performance.now(),
     smallFlushTimer: null,
-    delayedChunk: null,
+    pendingTailChunks: [],
     generation: audioPlaybackGeneration,
   };
 }
@@ -392,6 +493,17 @@ function pcmArrayBufferToChunk(arrayBuffer, sampleRate = PLAYBACK_SAMPLE_RATE) {
   };
 }
 
+function mergeChunksToChunk(chunks) {
+  const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(new Uint8Array(chunk.arrayBuffer).slice(0, chunk.bytes), offset);
+    offset += chunk.bytes;
+  }
+  return pcmArrayBufferToChunk(merged.buffer, PLAYBACK_SAMPLE_RATE);
+}
+
 function makeSilenceChunk(durationMs = TAIL_SILENCE_MS) {
   const bytes = Math.floor((PLAYBACK_SAMPLE_RATE * durationMs * 2) / 1000);
   const evenBytes = bytes % 2 === 0 ? bytes : bytes + 1;
@@ -433,13 +545,49 @@ function mergePcmChunks(chunks, appendSilence = false) {
   return pcmArrayBufferToChunk(buffer, PLAYBACK_SAMPLE_RATE);
 }
 
-function prepareTailChunk(chunk) {
-  if (!chunk) return null;
-  const minTailBytes = makeSilenceChunk(Math.max(TAIL_SILENCE_MS, TAIL_FADE_MS)).bytes;
-  const outputBytes = Math.max(chunk.bytes, minTailBytes);
+function removeTailDcOffset(bytes, validBytes, durationMs = TAIL_FADE_MS) {
+  const evenBytes = validBytes % 2 === 0 ? validBytes : validBytes - 1;
+  const sampleCount = Math.floor(evenBytes / 2);
+  const windowSamples = Math.min(sampleCount, Math.floor((PLAYBACK_SAMPLE_RATE * durationMs) / 1000));
+  if (windowSamples <= 0) return 0;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const firstSample = sampleCount - windowSamples;
+  let sum = 0;
+  for (let i = firstSample; i < sampleCount; i += 1) {
+    sum += view.getInt16(i * 2, true);
+  }
+  const offset = Math.round(sum / windowSamples);
+  if (Math.abs(offset) < 96) return offset;
+  for (let i = firstSample; i < sampleCount; i += 1) {
+    const byteOffset = i * 2;
+    const sample = view.getInt16(byteOffset, true);
+    const corrected = Math.max(-32768, Math.min(32767, sample - offset));
+    view.setInt16(byteOffset, corrected, true);
+  }
+  return offset;
+}
+
+function mergeTailChunks(chunks) {
+  const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+  const minTailBytes = makeSilenceChunk(TAIL_FADE_MS).bytes;
+  const outputBytes = Math.max(totalBytes, minTailBytes);
   const output = new Uint8Array(outputBytes);
-  output.set(new Uint8Array(chunk.arrayBuffer).slice(0, chunk.bytes), 0);
-  fadeOutPcm16Bytes(output, chunk.bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(new Uint8Array(chunk.arrayBuffer).slice(0, chunk.bytes), offset);
+    offset += chunk.bytes;
+  }
+  const dcOffset = removeTailDcOffset(output, totalBytes);
+  fadeOutPcm16Bytes(output, totalBytes, TAIL_FADE_MS);
+  log("tail buffer prepared", {
+    pendingTailChunks: chunks.length,
+    tailBufferBytes: outputBytes,
+    sourceBytes: totalBytes,
+    lastChunkBytes: chunks.length ? chunks[chunks.length - 1].bytes : 0,
+    lastChunkShort: chunks.length ? chunks[chunks.length - 1].bytes < SHORT_TAIL_CHUNK_BYTES : false,
+    fadeOutMs: TAIL_FADE_MS,
+    dcOffset,
+  });
   return pcmArrayBufferToChunk(output.buffer, PLAYBACK_SAMPLE_RATE);
 }
 
@@ -481,18 +629,81 @@ function queueDecodedChunk(playback, chunk) {
   trimTtsQueue(playback);
 }
 
-function flushDelayedTtsChunk(playback, asTail = false) {
-  if (!playback || !playback.delayedChunk) return;
-  const chunk = asTail ? prepareTailChunk(playback.delayedChunk) : playback.delayedChunk;
-  playback.delayedChunk = null;
-  queueDecodedChunk(playback, chunk);
+function coalescePlaybackChunks(playback) {
+  if (!playback || playback.pendingChunks.length < 2) return;
+  const coalesced = [];
+  let smallGroup = [];
+  let smallBytes = 0;
+  for (const chunk of playback.pendingChunks) {
+    if (chunk.bytes < MIN_PLAYBACK_BLOCK_BYTES && !playback.ttsDone) {
+      smallGroup.push(chunk);
+      smallBytes += chunk.bytes;
+      if (smallBytes >= MIN_PLAYBACK_BLOCK_BYTES) {
+        coalesced.push(mergeChunksToChunk(smallGroup));
+        smallGroup = [];
+        smallBytes = 0;
+      }
+      continue;
+    }
+    if (smallGroup.length) {
+      coalesced.push(mergeChunksToChunk(smallGroup));
+      smallGroup = [];
+      smallBytes = 0;
+    }
+    coalesced.push(chunk);
+  }
+  if (smallGroup.length) {
+    coalesced.push(mergeChunksToChunk(smallGroup));
+  }
+  playback.pendingChunks = coalesced;
+}
+
+function enqueuePendingTailChunks(playback, asTail = false) {
+  if (!playback || playback.pendingTailChunks.length === 0) return;
+  if (asTail) {
+    const tailChunk = mergeTailChunks(playback.pendingTailChunks);
+    playback.pendingTailChunks = [];
+    queueDecodedChunk(playback, tailChunk);
+    return;
+  }
+  while (playback.pendingTailChunks.length) {
+    queueDecodedChunk(playback, playback.pendingTailChunks.shift());
+  }
+}
+
+function appendFullTtsBuffer(replyId, chunk) {
+  const key = replyId || "__unknown__";
+  const chunks = fullTtsBuffersByReplyId.get(key) || [];
+  chunks.push(chunk);
+  fullTtsBuffersByReplyId.set(key, chunks);
+}
+
+async function playFullTtsBuffer(replyId) {
+  const key = replyId || "__unknown__";
+  const chunks = fullTtsBuffersByReplyId.get(key);
+  if (!chunks || chunks.length === 0) return;
+  fullTtsBuffersByReplyId.delete(key);
+  const merged = mergeChunksToChunk(chunks);
+  const playback = getOrCreateReplyPlayback(replyId || currentReplyId || "__full_buffer__");
+  playback.ttsDone = true;
+  playback.tailMode = true;
+  playback.started = true;
+  playback.pendingChunks.push(merged);
+  playback.bufferedDuration += merged.duration;
+  playback.totalPendingDuration += merged.duration;
+  log("full tts buffer playback", {
+    replyId: playback.replyId,
+    chunks: chunks.length,
+    bytes: merged.bytes,
+    durationMs: Math.round(merged.duration * 1000),
+  });
+  await flushReplyPlayback(playback, true);
 }
 
 function trimTtsQueue(playback) {
   if (!playback) return;
   while (
-    playback.pendingChunks.length + playback.pendingSmallChunks.length > MAX_TTS_QUEUE_CHUNKS ||
-    playback.bufferedDuration > MAX_TTS_BUFFER_SEC
+    playback.pendingChunks.length + playback.pendingSmallChunks.length > MAX_TTS_QUEUE_CHUNKS
   ) {
     const dropped = playback.pendingChunks.shift();
     if (!dropped) break;
@@ -502,6 +713,14 @@ function trimTtsQueue(playback) {
       replyId: playback.replyId,
       ttsQueueSize: getTtsQueueSize(),
       bufferedDuration: playback.bufferedDuration,
+    });
+  }
+  if (playback.bufferedDuration > MAX_TTS_BUFFER_SEC) {
+    console.warn("[playback] high tts buffered duration", {
+      replyId: playback.replyId,
+      bufferedDuration: playback.bufferedDuration,
+      pendingChunks: playback.pendingChunks.length,
+      pendingSmallChunks: playback.pendingSmallChunks.length,
     });
   }
 }
@@ -536,6 +755,7 @@ function logPlaybackSummary(playback, ctx, force = false) {
     pendingChunks: playback.pendingChunks.length,
     pendingSmallChunks: playback.pendingSmallChunks.length,
     pendingSmallBytes: playback.pendingSmallBytes,
+    pendingTailChunks: playback.pendingTailChunks.length,
     nextPlayTime: playback.nextPlayTime,
     currentTime: ctx ? ctx.currentTime : null,
     activeSources: playback.activeSources.size,
@@ -571,7 +791,11 @@ function stopPlaybackSummaryTimer() {
 function startPerformanceTimer() {
   if (!DEBUG) return;
   if (perfStatsTimer) return;
+  perfExpectedNextAt = performance.now() + 1000;
   perfStatsTimer = setInterval(() => {
+    const now = performance.now();
+    const mainThreadLagMs = Math.max(0, now - perfExpectedNextAt);
+    perfExpectedNextAt = now + 1000;
     const playback = currentReplyPlayback;
     const ctx = playbackAudioContext && playbackAudioContext.state !== "closed" ? playbackAudioContext : null;
     const bufferAhead = playback && ctx ? playback.nextPlayTime - ctx.currentTime : 0;
@@ -588,11 +812,16 @@ function startPerformanceTimer() {
       sessionId: currentSessionId,
       currentReplyId,
       wsBufferedAmount: ws ? ws.bufferedAmount : 0,
+      wsSendQueueLength: ws ? ws.bufferedAmount : 0,
       audioPacketsSentPerSec: audioPacketsSentLastSecond,
       wsSendPerSec: wsSendCountLastSecond,
+      micQueueLength: audioSender ? audioSender.queueLength : 0,
       audioQueueSize: audioSender ? audioSender.queueLength : 0,
       ttsQueueSize: getTtsQueueSize(),
+      ttsPlaybackQueueLength: getTtsQueueSize(),
+      playbackBacklogMs: Math.round(bufferAhead * 1000),
       playbackLagMs: Math.max(0, -bufferAhead) * 1000,
+      mainThreadLagMs: Math.round(mainThreadLagMs),
       activeTimerCount: getActiveTimerCount(),
       activeWsListenerCount: wsListenersAttached ? 4 : 0,
       memoryUsage: memory,
@@ -605,6 +834,8 @@ function startPerformanceTimer() {
       activeSourcesSize: playback ? playback.activeSources.size : 0,
       pendingChunksLength: playback ? playback.pendingChunks.length : 0,
       pendingSmallBytes: playback ? playback.pendingSmallBytes : 0,
+      pendingTailChunks: playback ? playback.pendingTailChunks.length : 0,
+      pendingTailChunksLength: playback ? playback.pendingTailChunks.length : 0,
       currentReplyTextDone: playback ? playback.textDone : false,
       currentReplyTtsDone: playback ? playback.ttsDone : false,
       audioCtxState: ctx ? ctx.state : null,
@@ -625,12 +856,13 @@ function stopPerformanceTimer() {
     clearInterval(perfStatsTimer);
     perfStatsTimer = null;
   }
+  perfExpectedNextAt = 0;
 }
 
 function getTtsQueueSize() {
   const playback = currentReplyPlayback;
   if (!playback) return 0;
-  return playback.pendingChunks.length + playback.pendingSmallChunks.length + playback.activeSources.size;
+  return playback.pendingChunks.length + playback.pendingSmallChunks.length + playback.pendingTailChunks.length + playback.activeSources.size;
 }
 
 function getActiveTimerCount() {
@@ -653,6 +885,7 @@ function maybeCleanupReplyPlayback(playback) {
     playback.ttsDone &&
     playback.pendingChunks.length === 0 &&
     playback.pendingSmallChunks.length === 0 &&
+    playback.pendingTailChunks.length === 0 &&
     playback.activeSources.size === 0 &&
     currentReplyPlayback === playback
   ) {
@@ -663,8 +896,16 @@ function maybeCleanupReplyPlayback(playback) {
       bytes: playback.bytes,
       underrunCount: playback.underrunCount,
     });
+    log("tts drain complete", {
+      replyId: playback.replyId,
+      drainMs: Math.round(performance.now() - playback.createdAt),
+      immediateStopOrClose: false,
+    });
     currentReplyPlayback = null;
     stopPlaybackSummaryTimer();
+    if (!waitingForNewReply && !interrupted) {
+      setCallState(CallState.LISTENING, "playback drain complete");
+    }
   }
 }
 
@@ -714,11 +955,12 @@ function scheduleDecodedChunk(playback, chunk, ctx, isTailChunk = false) {
   const scheduledGap = previousEndTime > 0 ? startAt - previousEndTime : 0;
 
   source.buffer = audioBuffer;
+  source.__doubaoGain = gain;
   source.connect(gain);
   gain.connect(ctx.destination);
   gain.gain.setValueAtTime(0.0001, startAt);
-  gain.gain.linearRampToValueAtTime(1, startAt + fadeIn);
-  gain.gain.setValueAtTime(1, Math.max(startAt + fadeIn, endAt - fadeOut));
+  gain.gain.linearRampToValueAtTime(PLAYBACK_GAIN, startAt + fadeIn);
+  gain.gain.setValueAtTime(PLAYBACK_GAIN, Math.max(startAt + fadeIn, endAt - fadeOut));
   gain.gain.linearRampToValueAtTime(0.0001, endAt);
   source.onended = () => {
     playback.activeSources.delete(source);
@@ -733,7 +975,20 @@ function scheduleDecodedChunk(playback, chunk, ctx, isTailChunk = false) {
   };
   playback.activeSources.add(source);
   source.start(startAt);
+  setCallState(CallState.SPEAKING, "local audio scheduled");
   playback.nextPlayTime = endAt;
+  if (DEBUG) {
+    console.log("[playback schedule chunk]", {
+      replyId: playback.replyId,
+      currentTime: now,
+      nextPlayTimeBefore: previousEndTime,
+      chunkDuration: audioBuffer.duration,
+      scheduledStartTime: startAt,
+      playbackBacklogMs: Math.round((playback.nextPlayTime - now) * 1000),
+      activeSources: playback.activeSources.size,
+      bytes: chunk.bytes,
+    });
+  }
   if (reconnectTimeline) {
     console.warn("[playback] reconnected", {
       replyId: playback.replyId,
@@ -755,6 +1010,7 @@ async function flushReplyPlayback(playback, force = false) {
   if (force || playback.ttsDone || playback.pendingSmallBytes >= SMALL_CHUNK_FLUSH_BYTES) {
     flushPendingSmallChunks(playback, playback.ttsDone);
   }
+  coalescePlaybackChunks(playback);
   const ctx = await getPlaybackContext(PLAYBACK_SAMPLE_RATE);
   if (playback.generation !== audioPlaybackGeneration) return;
   const dynamicStartBufferSec =
@@ -789,12 +1045,16 @@ async function schedulePcm16Chunk(base64Audio, sampleRate = 24000, replyId = nul
   if (generation !== audioPlaybackGeneration) return null;
   const chunk = decodePcm16Chunk(base64Audio, PLAYBACK_SAMPLE_RATE);
   if (!chunk) return null;
+  if (DEBUG_PLAY_FULL_TTS_BUFFER) {
+    appendFullTtsBuffer(replyId, chunk);
+    return null;
+  }
   const playback = getOrCreateReplyPlayback(replyId);
   if (playback.generation !== generation) return null;
-  if (playback.delayedChunk) {
-    queueDecodedChunk(playback, playback.delayedChunk);
+  playback.pendingTailChunks.push(chunk);
+  while (playback.pendingTailChunks.length > TAIL_HOLD_CHUNKS) {
+    queueDecodedChunk(playback, playback.pendingTailChunks.shift());
   }
-  playback.delayedChunk = chunk;
   scheduleTailSmallFlush(playback);
   await flushReplyPlayback(playback);
   return null;
@@ -805,6 +1065,44 @@ function playPcm16(base64Audio, sampleRate) {
     log("schedule pcm16 failed", { message: err.message });
     return null;
   });
+}
+
+function fadeAndStopSource(source) {
+  const ctx = playbackAudioContext && playbackAudioContext.state !== "closed" ? playbackAudioContext : null;
+  if (!ctx) {
+    try {
+      source.stop();
+      source.disconnect();
+    } catch (err) {
+      // Source may already be stopped.
+    }
+    return;
+  }
+  const gain = source.__doubaoGain;
+  const now = ctx.currentTime;
+  const stopAt = now + INTERRUPT_FADE_MS / 1000;
+  try {
+    if (gain) {
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(gain.gain.value || PLAYBACK_GAIN, now);
+      gain.gain.linearRampToValueAtTime(0.0001, stopAt);
+    }
+    source.stop(stopAt + 0.005);
+  } catch (err) {
+    try {
+      source.stop();
+    } catch (innerErr) {
+      // Source may already be stopped.
+    }
+  }
+  setTimeout(() => {
+    try {
+      source.disconnect();
+      if (gain) gain.disconnect();
+    } catch (err) {
+      // Source may already be disconnected.
+    }
+  }, INTERRUPT_FADE_MS + 30);
 }
 
 function stopPlayback(markInterrupted = true) {
@@ -818,13 +1116,8 @@ function stopPlayback(markInterrupted = true) {
   audioPlaybackGeneration += 1;
   const sources = currentReplyPlayback ? [...currentReplyPlayback.activeSources] : [];
   for (const source of sources) {
-    try {
-      source.onended = null;
-      source.stop();
-      source.disconnect();
-    } catch (err) {
-      // Source may already be stopped.
-    }
+    source.onended = null;
+    fadeAndStopSource(source);
   }
   if (currentReplyPlayback) {
     clearSmallFlushTimer(currentReplyPlayback);
@@ -832,9 +1125,10 @@ function stopPlayback(markInterrupted = true) {
     currentReplyPlayback.pendingSmallChunks = [];
     currentReplyPlayback.pendingSmallBytes = 0;
     currentReplyPlayback.bufferedDuration = 0;
-    currentReplyPlayback.delayedChunk = null;
+    currentReplyPlayback.pendingTailChunks = [];
     currentReplyPlayback.activeSources.clear();
   }
+  fullTtsBuffersByReplyId.clear();
   currentReplyPlayback = null;
   stopPlaybackSummaryTimer();
   if (markInterrupted) {
@@ -862,6 +1156,47 @@ function updateButtons() {
   stopBtn.disabled = !connectedOrConnecting;
 }
 
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function scheduleWsReconnect(reason) {
+  if (manualStopRequested || !userStartRequested) {
+    resetCallState();
+    return;
+  }
+  if (reconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) {
+    log("websocket reconnect exhausted", { attempts: reconnectAttempts, reason });
+    resetCallState();
+    return;
+  }
+  reconnectAttempts += 1;
+  const delay = Math.min(
+    WS_RECONNECT_MAX_DELAY_MS,
+    WS_RECONNECT_BASE_DELAY_MS * 2 ** (reconnectAttempts - 1)
+  );
+  stopRecording();
+  stopAllAudio(false);
+  wsReady = false;
+  backendReady = false;
+  ws = null;
+  updateButtons();
+  setStatus(`WebSocket 断开，${Math.round(delay / 1000)} 秒后重连...`);
+  log("websocket reconnect scheduled", { attempts: reconnectAttempts, delayMs: delay, reason });
+  clearReconnectTimer();
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (manualStopRequested || !userStartRequested) return;
+    startCall({ reconnect: true }).catch((err) => {
+      log("reconnect failed", { message: err.message });
+      scheduleWsReconnect("reconnect_failed");
+    });
+  }, delay);
+}
+
 function stopRecording() {
   log("stop recording");
   recordingStarted = false;
@@ -878,6 +1213,19 @@ function stopRecording() {
   if (assistantTextFlushTimer) {
     clearTimeout(assistantTextFlushTimer);
     assistantTextFlushTimer = null;
+  }
+  if (userSpeechEndTimer) {
+    clearTimeout(userSpeechEndTimer);
+    userSpeechEndTimer = null;
+    userSpeechEndDeadline = 0;
+  }
+  if (audioEventStatsTimer) {
+    clearTimeout(audioEventStatsTimer);
+    flushAudioEventStats();
+  }
+  if (userTextStatsTimer) {
+    clearTimeout(userTextStatsTimer);
+    flushUserTextStats();
   }
   if (processorNode) {
     try {
@@ -907,6 +1255,7 @@ function resetCallState() {
   if (isResetting) return;
   isResetting = true;
   log("reset call state");
+  clearReconnectTimer();
 
   recordingStarted = false;
   wsReady = false;
@@ -916,6 +1265,7 @@ function resetCallState() {
   interruptedReplyId = null;
   currentReplyId = null;
   currentSessionId = null;
+  reconnectAttempts = 0;
   activeAssistantReplyId = null;
   interimUserMessageEl = null;
   activeAssistantMessageEl = null;
@@ -925,6 +1275,12 @@ function resetCallState() {
   userStartRequested = false;
   finalUserText = "";
   interimUserText = "";
+  lastAsrActivityAt = 0;
+  audioEventStats = null;
+  userTextStats = null;
+  fullTtsBuffersByReplyId.clear();
+  lastUserTextByReplyId.clear();
+  assistantTextDoneReplyIds.clear();
 
   stopRecording();
   stopAllAudio(false);
@@ -1089,10 +1445,20 @@ function flushUserInterimText() {
 function handleUserTextMessage(msg) {
   const text = msg.text || "";
   if (!text.trim()) return;
+  const replyId = msg.reply_id || currentReplyId || "__current__";
+  const previous = lastUserTextByReplyId.get(replyId);
+  if (previous === text) {
+    recordUserTextStats("duplicate", replyId, text);
+    return;
+  }
+  lastUserTextByReplyId.set(replyId, text);
+  recordUserTextStats("change", replyId, text);
+  lastAsrActivityAt = performance.now();
+  cancelUserSpeechEndDebounce("user_text");
   if (msg.is_interim) {
     latestUserInterimText = text;
     if (!userInterimFlushTimer) {
-      userInterimFlushTimer = setTimeout(flushUserInterimText, 100);
+      userInterimFlushTimer = setTimeout(flushUserInterimText, USER_TEXT_FLUSH_MS);
     }
     return;
   }
@@ -1103,6 +1469,39 @@ function handleUserTextMessage(msg) {
   latestUserInterimText = "";
   appendOrUpdateInterimUserText(text, true);
   log("user_text final", { text, replyId: msg.reply_id || null });
+}
+
+function cancelUserSpeechEndDebounce(reason) {
+  if (!userSpeechEndTimer) return;
+  clearTimeout(userSpeechEndTimer);
+  userSpeechEndTimer = null;
+  userSpeechEndDeadline = 0;
+  log("user_speech_end debounce cancelled", { reason });
+}
+
+function scheduleUserSpeechEndDebounce(msg) {
+  cancelUserSpeechEndDebounce("reschedule");
+  const scheduledAt = performance.now();
+  userSpeechEndDeadline = scheduledAt + ASR_END_DEBOUNCE_MS;
+  userSpeechEndTimer = setTimeout(() => {
+    userSpeechEndTimer = null;
+    const now = performance.now();
+    if (lastAsrActivityAt > scheduledAt) {
+      log("user_speech_end debounce skipped", {
+        reason: "new_asr_activity",
+        elapsedMs: Math.round(now - scheduledAt),
+      });
+      return;
+    }
+    interimUserText = "";
+    interimUserMessageEl = null;
+    setCallState(CallState.THINKING, "user_speech_end debounce");
+    log("user speech end debounced", {
+      replyId: msg.reply_id || null,
+      debounceMs: ASR_END_DEBOUNCE_MS,
+      elapsedMs: Math.round(now - scheduledAt),
+    });
+  }, ASR_END_DEBOUNCE_MS);
 }
 
 function appendOrUpdateAssistantText(text, replyId) {
@@ -1131,7 +1530,7 @@ function queueAssistantText(text, replyId) {
   const key = replyId || "__current__";
   pendingAssistantTextByReplyId.set(key, (pendingAssistantTextByReplyId.get(key) || "") + text);
   if (!assistantTextFlushTimer) {
-    assistantTextFlushTimer = setTimeout(flushAssistantText, 100);
+    assistantTextFlushTimer = setTimeout(flushAssistantText, ASSISTANT_TEXT_FLUSH_MS);
   }
 }
 
@@ -1170,7 +1569,17 @@ function markReplyTextDone(replyId, reason) {
 function markReplyTtsDone(replyId, reason) {
   const playback = currentReplyPlayback;
   if (!playback) return;
-  if (replyId && playback.replyId && replyId !== playback.replyId) return;
+  if (replyId && playback.replyId && replyId !== playback.replyId) {
+    console.warn("[playback] tts_done reply mismatch; flushing current playback", {
+      doneReplyId: replyId,
+      playbackReplyId: playback.replyId,
+      reason,
+      pendingChunks: playback.pendingChunks.length,
+      pendingSmallChunks: playback.pendingSmallChunks.length,
+      pendingTailChunks: playback.pendingTailChunks.length,
+      activeSources: playback.activeSources.size,
+    });
+  }
   playback.ttsDone = true;
   playback.tailMode = true;
   if (DEBUG) console.log("[tts done]", {
@@ -1178,12 +1587,21 @@ function markReplyTtsDone(replyId, reason) {
     reason,
     pendingChunks: playback.pendingChunks.length,
     pendingSmallChunks: playback.pendingSmallChunks.length,
-    hasDelayedChunk: !!playback.delayedChunk,
+    pendingTailChunks: playback.pendingTailChunks.length,
     activeSources: playback.activeSources.size,
   });
   audioScheduleChain = audioScheduleChain
     .then(() => {
-      flushDelayedTtsChunk(playback, true);
+      if (DEBUG_PLAY_FULL_TTS_BUFFER) {
+        return playFullTtsBuffer(replyId || playback.replyId);
+      }
+      log("tts tail flush", {
+        replyId: playback.replyId,
+        pendingTailChunks: playback.pendingTailChunks.length,
+        fadeOutMs: TAIL_FADE_MS,
+        immediateStopOrClose: false,
+      });
+      enqueuePendingTailChunks(playback, true);
       return flushReplyPlayback(playback, true);
     })
     .catch((err) => log("flush tts audio failed", { message: err.message, replyId: playback.replyId }));
@@ -1197,6 +1615,8 @@ function resetChatMessages() {
   assistantTextByReplyId = new Map();
   pendingAssistantTextByReplyId.clear();
   latestUserInterimText = "";
+  lastUserTextByReplyId.clear();
+  assistantTextDoneReplyIds.clear();
 }
 
 function maybeStartRecording() {
@@ -1250,16 +1670,13 @@ function handleServerMessage(event) {
       log("drop non-352 audio message", { event: msg.event || null });
       return;
     }
-    log("audio event 352 received", {
-      replyId: msg.reply_id || null,
-      sampleRate: msg.sample_rate || null,
-      bytes: base64DecodedByteLength(msg.audio),
-    });
+    recordAudioEvent352(msg);
     setCallState(CallState.SPEAKING, "audio");
     enqueueAudio(msg);
     return;
   }
   if (msg.type === "user_speech_start") {
+    cancelUserSpeechEndDebounce("user_speech_start");
     setCallState(CallState.INTERRUPTED, "user_speech_start");
     log("waitingForNewReply true", { currentReplyId, speechReplyId: msg.reply_id || null });
     stopAllAudio();
@@ -1271,23 +1688,24 @@ function handleServerMessage(event) {
     return;
   }
   if (msg.type === "user_speech_end") {
-    interimUserText = "";
-    interimUserMessageEl = null;
-    setCallState(CallState.THINKING, "user_speech_end");
-    log("user speech end", msg);
+    scheduleUserSpeechEndDebounce(msg);
+    log("user speech end debounce scheduled", {
+      replyId: msg.reply_id || null,
+      debounceMs: ASR_END_DEBOUNCE_MS,
+    });
     return;
   }
   if (msg.type === "assistant_text_done") {
     flushTextQueues();
+    if (msg.reply_id) assistantTextDoneReplyIds.add(msg.reply_id);
     markReplyTextDone(msg.reply_id || currentReplyId, "assistant_text_done");
     finishAssistantMessage();
-    log("assistant text done", msg);
+    log("assistant text done", { replyId: msg.reply_id || currentReplyId, event: msg.event || null });
     return;
   }
   if (msg.type === "tts_done") {
     markReplyTtsDone(msg.reply_id || currentReplyId, "tts_done");
     log("tts done", msg);
-    setCallState(CallState.LISTENING, "tts_done");
     return;
   }
   if (msg.type === "event" && msg.event === 350) {
@@ -1310,6 +1728,7 @@ function handleServerMessage(event) {
   if (msg.type === "event" && msg.event === 559) {
     const replyId = msg.reply_id || (msg.payload && msg.payload.reply_id) || currentReplyId;
     flushTextQueues();
+    if (replyId) assistantTextDoneReplyIds.add(replyId);
     markReplyTextDone(replyId, "event 559");
     finishAssistantMessage();
     log("event 559", { replyId });
@@ -1385,7 +1804,7 @@ async function startRecording() {
   setStatus("正在通话");
 }
 
-async function startCall() {
+async function startCall({ reconnect = false } = {}) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     setStatus("已经连接");
     log("already connected");
@@ -1396,12 +1815,17 @@ async function startCall() {
     log("websocket already connecting");
     return;
   }
-  if (ws && (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED)) {
+  if (!reconnect && ws && (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED)) {
     resetCallState();
   }
 
+  if (!reconnect) {
+    manualStopRequested = false;
+    reconnectAttempts = 0;
+    clearReconnectTimer();
+  }
   userStartRequested = true;
-  roundId += 1;
+  if (!reconnect) roundId += 1;
   finalUserText = "";
   interimUserText = "";
   currentReplyId = null;
@@ -1421,6 +1845,12 @@ async function startCall() {
   maxWsBufferedAmount = 0;
   browserAudioPacketsReceived = 0;
   browserAudioBytesReceived = 0;
+  lastAsrActivityAt = 0;
+  audioEventStats = null;
+  userTextStats = null;
+  fullTtsBuffersByReplyId.clear();
+  lastUserTextByReplyId.clear();
+  assistantTextDoneReplyIds.clear();
   wsReady = false;
   backendReady = false;
   recordingStarted = false;
@@ -1435,26 +1865,39 @@ async function startCall() {
   setStatus("正在连接后端...");
 
   const wsUrl = websocketUrl();
-  log("create new websocket", { url: wsUrl });
+  log(reconnect ? "reconnect websocket" : "create new websocket", {
+    url: wsUrl.replace(/([?&]token=)[^&]+/, "$1***"),
+    reconnect,
+    reconnectAttempts,
+  });
   ws = new WebSocket(wsUrl);
+  const socket = ws;
   updateButtons();
-  ws.binaryType = "arraybuffer";
+  socket.binaryType = "arraybuffer";
   wsListenersAttached = true;
-  ws.onopen = () => {
+  socket.onopen = () => {
+    reconnectAttempts = 0;
     wsReady = true;
     setStatus("后端 WebSocket 已连接，等待 backend ready...");
-    log("websocket open");
+    log("websocket open", { reconnect });
     updateButtons();
     maybeStartRecording();
   };
-  ws.onmessage = handleServerMessage;
-  ws.onerror = () => {
+  socket.onmessage = handleServerMessage;
+  socket.onerror = () => {
     log("websocket error");
   };
-  ws.onclose = () => {
-    log("websocket closed");
+  socket.onclose = () => {
+    log("websocket closed", { manualStopRequested, userStartRequested, reconnectAttempts });
     wsListenersAttached = false;
-    resetCallState();
+    wsReady = false;
+    backendReady = false;
+    if (ws === socket) ws = null;
+    if (manualStopRequested || !userStartRequested) {
+      resetCallState();
+      return;
+    }
+    scheduleWsReconnect("close");
   };
 }
 
@@ -1465,6 +1908,8 @@ function cleanupAudio() {
 }
 
 function stopCall() {
+  manualStopRequested = true;
+  clearReconnectTimer();
   stopRecording();
   stopAllAudio(false);
   if (ws && ws.readyState === WebSocket.OPEN) {
