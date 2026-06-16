@@ -3,7 +3,7 @@
 __pycache__/
 .env
 backend/.env
-backend/_pycache_
+backend/__pycache__/
 debug_tts/
 data/
 backend/probe_sqlite.db*
