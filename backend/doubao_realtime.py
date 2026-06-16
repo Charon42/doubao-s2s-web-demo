@@ -379,7 +379,7 @@ class DoubaoRealtimeConfig:
                 + ", ".join(missing)
                 + f"; 当前工作目录={Path.cwd()}; .env路径={ENV_PATH}"
             )
-        validateVoiceConfig(self)
+        validate_voice_config(self)
 
 
 @dataclass
@@ -413,7 +413,7 @@ def _safe_filename_part(value: str, fallback: str = "unknown") -> str:
     return clean[:80] or fallback
 
 
-def validateVoiceConfig(config: DoubaoRealtimeConfig) -> None:
+def validate_voice_config(config: DoubaoRealtimeConfig) -> None:
     if config.voice_model_type not in VOICE_MODEL_TYPES:
         raise DoubaoConfigError(f"VOICE_MODEL_TYPE must be one of {sorted(VOICE_MODEL_TYPES)}")
     if config.voice_profile not in VOICE_PROFILES:
@@ -434,8 +434,8 @@ def validateVoiceConfig(config: DoubaoRealtimeConfig) -> None:
         raise DoubaoConfigError("SC2.0 requires VOICE_CHARACTER_MANIFEST")
 
 
-def buildDoubaoStartSessionConfig(config: DoubaoRealtimeConfig) -> dict[str, Any]:
-    validateVoiceConfig(config)
+def build_doubao_start_session_config(config: DoubaoRealtimeConfig) -> dict[str, Any]:
+    validate_voice_config(config)
     dialog: dict[str, Any] = {
         "extra": {
             "model": config.model_version,
@@ -475,6 +475,10 @@ def buildDoubaoStartSessionConfig(config: DoubaoRealtimeConfig) -> dict[str, Any
         },
         "dialog": dialog,
     }
+
+
+validateVoiceConfig = validate_voice_config
+buildDoubaoStartSessionConfig = build_doubao_start_session_config
 
 
 def build_headers(config: DoubaoRealtimeConfig, connect_id: str) -> dict[str, str]:
@@ -674,7 +678,7 @@ class DoubaoRealtimeClient:
         return decode_packet(message)
 
     def _start_session_payload(self) -> dict[str, Any]:
-        return buildDoubaoStartSessionConfig(self.config)
+        return build_doubao_start_session_config(self.config)
 
     def _log_persona_config(self) -> None:
         print("已加载人设配置")

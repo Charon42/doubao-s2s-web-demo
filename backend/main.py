@@ -15,11 +15,15 @@ from fastapi.staticfiles import StaticFiles
 
 try:
     from .audio_utils import decode_base64_audio, encoded_audio_to_pcm16_16k_mono
+    from .db import create_conversation, end_conversation, init_db, save_message
     from .doubao_realtime import DoubaoConfigError, DoubaoRealtimeClient, cancel_and_wait
+    from .intent import detect_intent
     from .memory import ConversationMemory
 except ImportError:
     from audio_utils import decode_base64_audio, encoded_audio_to_pcm16_16k_mono
+    from db import create_conversation, end_conversation, init_db, save_message
     from doubao_realtime import DoubaoConfigError, DoubaoRealtimeClient, cancel_and_wait
+    from intent import detect_intent
     from memory import ConversationMemory
 
 
@@ -66,6 +70,11 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 
+@app.on_event("startup")
+async def startup() -> None:
+    await asyncio.to_thread(init_db)
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(FRONTEND_DIR / "index.html")
@@ -88,17 +97,30 @@ async def call_ws(websocket: WebSocket) -> None:
     print("浏览器 WebSocket 已连接")
     browser_closed = False
     tasks: set[asyncio.Task] = set()
+    db_tasks: set[asyncio.Task] = set()
     doubao = None
     memory = ConversationMemory()
+    conversation_id: int | None = None
+    pending_user_text: dict[str, str | int | None] | None = None
+    saved_user_questions: set[str] = set()
+    assistant_text_buffers: dict[str, dict[str, str | int | None]] = {}
     browser_audio_packets_received = 0
     browser_audio_bytes_received = 0
     mobile_audio_packets_received = 0
     mobile_audio_bytes_received = 0
 
+    def schedule_db_write(func, *args) -> None:
+        task = asyncio.create_task(asyncio.to_thread(func, *args))
+        db_tasks.add(task)
+        task.add_done_callback(db_tasks.discard)
+
     try:
         doubao = DoubaoRealtimeClient()
         print("准备连接豆包 WebSocket")
         await doubao.connect()
+        conversation_id = await asyncio.to_thread(create_conversation, doubao.session_id)
+        if conversation_id:
+            print(f"conversation created id={conversation_id}, session_id={doubao.session_id}")
         print("豆包 WebSocket 连接成功")
     except DoubaoConfigError as exc:
         print("豆包 WebSocket 连接失败")
@@ -131,6 +153,72 @@ async def call_ws(websocket: WebSocket) -> None:
             "output_sample_rate": doubao.config.output_sample_rate,
         },
     )
+
+    def remember_user_text(event: dict) -> None:
+        nonlocal pending_user_text
+        text = str(event.get("text") or "").strip()
+        if not text:
+            return
+        pending_user_text = {
+            "text": text,
+            "question_id": event.get("question_id"),
+            "reply_id": event.get("reply_id"),
+            "event_id": event.get("event"),
+        }
+
+    def save_pending_user_text(event: dict) -> None:
+        nonlocal pending_user_text
+        if not conversation_id or not pending_user_text:
+            return
+        text = str(pending_user_text.get("text") or "").strip()
+        if not text:
+            return
+        question_id = pending_user_text.get("question_id") or event.get("question_id")
+        reply_id = pending_user_text.get("reply_id") or event.get("reply_id")
+        dedupe_key = str(question_id or reply_id or text)
+        if dedupe_key in saved_user_questions:
+            pending_user_text = None
+            return
+        saved_user_questions.add(dedupe_key)
+        memory.add("user", text)
+        schedule_db_write(save_message, conversation_id, "user", text, question_id, reply_id, 459)
+        print(f"intent detected {json.dumps(detect_intent(text), ensure_ascii=False)}")
+        pending_user_text = None
+
+    def append_assistant_text(event: dict) -> None:
+        text = str(event.get("text") or "")
+        if not text:
+            return
+        reply_id = str(event.get("reply_id") or "__current__")
+        item = assistant_text_buffers.setdefault(
+            reply_id,
+            {
+                "text": "",
+                "question_id": event.get("question_id"),
+                "reply_id": event.get("reply_id"),
+                "event_id": event.get("event"),
+            },
+        )
+        item["text"] = str(item.get("text") or "") + text
+        item["question_id"] = item.get("question_id") or event.get("question_id")
+        item["reply_id"] = item.get("reply_id") or event.get("reply_id")
+
+    def save_assistant_text(event: dict) -> None:
+        if not conversation_id:
+            return
+        reply_id = str(event.get("reply_id") or "__current__")
+        item = assistant_text_buffers.pop(reply_id, None)
+        if item is None and len(assistant_text_buffers) == 1:
+            _, item = assistant_text_buffers.popitem()
+        if not item:
+            return
+        text = str(item.get("text") or "").strip()
+        if not text:
+            return
+        question_id = item.get("question_id") or event.get("question_id")
+        saved_reply_id = item.get("reply_id") or event.get("reply_id")
+        memory.add("assistant", text)
+        schedule_db_write(save_message, conversation_id, "assistant", text, question_id, saved_reply_id, event.get("event") or 559)
 
     async def browser_to_doubao() -> None:
         nonlocal browser_closed, browser_audio_packets_received, browser_audio_bytes_received
@@ -235,9 +323,15 @@ async def call_ws(websocket: WebSocket) -> None:
             if browser_closed:
                 break
             if event["type"] == "user_text":
-                memory.add("user", event.get("text", ""))
+                remember_user_text(event)
+                if not event.get("is_interim"):
+                    save_pending_user_text(event)
+            elif event["type"] == "user_speech_end":
+                save_pending_user_text(event)
             elif event["type"] == "assistant_text":
-                memory.add("assistant", event.get("text", ""))
+                append_assistant_text(event)
+            elif event["type"] == "assistant_text_done":
+                save_assistant_text(event)
             sent = await safe_send_json(websocket, event)
             if not sent:
                 browser_closed = True
@@ -271,6 +365,10 @@ async def call_ws(websocket: WebSocket) -> None:
     finally:
         if tasks:
             await cancel_and_wait(*tasks)
+        if conversation_id:
+            schedule_db_write(end_conversation, conversation_id, None)
+        if db_tasks:
+            await asyncio.gather(*db_tasks, return_exceptions=True)
         try:
             await doubao.close()
         except Exception:
